@@ -1,0 +1,9 @@
+#!/usr/bin/make -f
+%:
+	dh $@
+
+override_dh_auto_build:
+	# nothing to compile
+
+override_dh_auto_install:
+	install -D -m 0755 src/chord debian/chord/usr/bin/chord

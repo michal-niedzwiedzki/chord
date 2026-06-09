@@ -1,0 +1,15 @@
+Source: chord
+Section: sound
+Priority: optional
+Maintainer: Michal <michal@epsi.pl>
+Build-Depends: debhelper-compat (= 13)
+Standards-Version: 4.6.2
+Rules-Requires-Root: no
+
+Package: chord
+Architecture: all
+Depends: ${misc:Depends}, python3, python3-mido, fluidsynth, fluid-soundfont-gm
+Description: CLI tool to play musical chords by name
+ Type a chord name and hear it played instantly via FluidSynth.
+ Supports standard chord notation (Dm7/9, Cmaj7, G7, F#m7b5, etc.),
+ Italian tempo markings (--allegro, --adagio, ...), and repeat count.

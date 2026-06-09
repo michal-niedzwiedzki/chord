@@ -1,0 +1,355 @@
+#!/usr/bin/env python3
+"""chord — play a named musical chord from the terminal."""
+
+import argparse
+import os
+import subprocess
+import sys
+import tempfile
+
+import mido
+
+C4 = 60
+
+NOTE_SEMITONES = {'C': 0, 'D': 2, 'E': 4, 'F': 5, 'G': 7, 'A': 9, 'B': 11}
+
+TEMPO_BPM = {
+    'larghissimo': 20,
+    'grave':       35,
+    'largo':       50,
+    'larghetto':   63,
+    'adagio':      72,
+    'andante':     92,
+    'andantino':   96,
+    'moderato':   114,
+    'allegretto': 120,
+    'allegro':    144,
+    'vivace':     172,
+    'presto':     192,
+    'prestissimo':208,
+}
+
+SOUNDFONT_PATHS = [
+    '/usr/share/sounds/sf2/FluidR3_GM.sf2',
+    '/usr/share/sounds/sf2/TimGM6mb.sf2',
+]
+
+# (suffix, semitone intervals) — longest match must come first within each family
+CHORD_QUALITIES = [
+    ('maj13',  [0, 4, 7, 11, 14, 17, 21]),
+    ('maj11',  [0, 4, 7, 11, 14, 17]),
+    ('maj9',   [0, 4, 7, 11, 14]),
+    ('maj7',   [0, 4, 7, 11]),
+    ('maj',    [0, 4, 7]),
+    ('M13',    [0, 4, 7, 11, 14, 17, 21]),
+    ('M11',    [0, 4, 7, 11, 14, 17]),
+    ('M9',     [0, 4, 7, 11, 14]),
+    ('M7',     [0, 4, 7, 11]),
+    ('M',      [0, 4, 7]),
+    ('mMaj7',  [0, 3, 7, 11]),
+    ('min13',  [0, 3, 7, 10, 14, 17, 21]),
+    ('min11',  [0, 3, 7, 10, 14, 17]),
+    ('min9',   [0, 3, 7, 10, 14]),
+    ('min7',   [0, 3, 7, 10]),
+    ('min',    [0, 3, 7]),
+    ('m13',    [0, 3, 7, 10, 14, 17, 21]),
+    ('m11',    [0, 3, 7, 10, 14, 17]),
+    ('m9',     [0, 3, 7, 10, 14]),
+    ('m7b5',   [0, 3, 6, 10]),
+    ('m7',     [0, 3, 7, 10]),
+    ('m',      [0, 3, 7]),
+    ('dim7',   [0, 3, 6, 9]),
+    ('dim',    [0, 3, 6]),
+    ('aug7',   [0, 4, 8, 10]),
+    ('aug',    [0, 4, 8]),
+    ('sus4',   [0, 5, 7]),
+    ('sus2',   [0, 2, 7]),
+    ('add11',  [0, 4, 7, 17]),
+    ('add9',   [0, 4, 7, 14]),
+    ('13',     [0, 4, 7, 10, 14, 17, 21]),
+    ('11',     [0, 4, 7, 10, 14, 17]),
+    ('9',      [0, 4, 7, 10, 14]),
+    ('9#11',   [0, 4, 7, 10, 14, 18]),
+    ('7#11',   [0, 4, 7, 10, 18]),
+    ('7#9',    [0, 4, 7, 10, 15]),
+    ('7b9',    [0, 4, 7, 10, 13]),
+    ('7b5',    [0, 4, 6, 10]),
+    ('7#5',    [0, 4, 8, 10]),
+    ('7',      [0, 4, 7, 10]),
+    ('6',      [0, 4, 7,  9]),
+    ('5',      [0, 7]),
+    ('',       [0, 4, 7]),  # plain major — must be last
+]
+
+DEGREE_SEMITONES = {2: 2, 4: 5, 6: 9, 7: 10, 9: 14, 11: 17, 13: 21}
+
+NOTE_NAMES = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B']
+
+VALID_DENOMINATORS = {1, 2, 4, 8, 16}
+
+# beats → human label
+DURATION_LABEL = {
+    4.0:    'whole',
+    3.0:    'dotted half',
+    2.0:    'half',
+    1.5:    'dotted quarter',
+    1.0:    'quarter',
+    0.75:   'dotted eighth',
+    0.5:    'eighth',
+    0.375:  'dotted 16th',
+    0.25:   '16th',
+}
+
+
+def duration_beats(s):
+    """Parse '4' or '2.' into a beat count (float). Raises ValueError on bad input."""
+    dotted = s.endswith('.')
+    base = s[:-1] if dotted else s
+    if not base.isdigit() or int(base) not in VALID_DENOMINATORS:
+        vals = ', '.join(str(v) for v in sorted(VALID_DENOMINATORS))
+        raise ValueError(f"duration must be one of {vals} (with optional '.' for dotted), got {s!r}")
+    beats = 4.0 / int(base)
+    return beats * 1.5 if dotted else beats
+
+
+def split_duration(token):
+    """Split 'Dm:4' into ('Dm', 1.0). Returns (token, None) when no ':' present."""
+    if ':' not in token:
+        return token, None
+    chord_part, dur_part = token.rsplit(':', 1)
+    return chord_part, duration_beats(dur_part)
+
+
+def parse_root(s):
+    """Return (semitone 0-11, chars_consumed) for the root note at start of s."""
+    if not s or s[0].upper() not in NOTE_SEMITONES:
+        raise ValueError(f"Expected a note name (A-G) at the start of {s!r}")
+    semi = NOTE_SEMITONES[s[0].upper()]
+    i = 1
+    while i < len(s) and s[i] in '#b':
+        semi += 1 if s[i] == '#' else -1
+        i += 1
+    return semi % 12, i
+
+
+def parse_chord(name):
+    """Return a sorted list of MIDI note numbers for the given chord name."""
+    s = name.strip()
+    root_semi, n = parse_root(s)
+    rest = s[n:]
+
+    bass_midi = None
+    slash_add = None
+
+    slash = rest.rfind('/')
+    if slash != -1:
+        after = rest[slash + 1:]
+        rest = rest[:slash]
+        if len(after) >= 2 and after[0] in '#b' and after[1:].isdigit():
+            sign = 1 if after[0] == '#' else -1
+            degree = int(after[1:])
+            if degree in DEGREE_SEMITONES:
+                slash_add = -(DEGREE_SEMITONES[degree] + sign)
+        elif after.isdigit():
+            slash_add = int(after)
+        elif after and after[0].upper() in NOTE_SEMITONES:
+            bass_semi, _ = parse_root(after)
+            bass_midi = bass_semi + 48  # octave 3
+
+    intervals = None
+    for quality, ivs in CHORD_QUALITIES:
+        if rest == quality:
+            intervals = ivs[:]
+            break
+    if intervals is None:
+        known = [q for q, _ in CHORD_QUALITIES if q]
+        raise ValueError(
+            f"unrecognized chord quality {rest!r} in {name!r}\n"
+            f"  Did you mean one of: {', '.join(known[:12])} ..."
+        )
+
+    if slash_add is not None:
+        ext = -slash_add if slash_add < 0 else DEGREE_SEMITONES.get(slash_add)
+        if ext is not None and ext not in intervals:
+            intervals.append(ext)
+            intervals.sort()
+
+    root_midi = root_semi + C4
+    notes = sorted(root_midi + iv for iv in intervals if root_midi + iv <= 127)
+
+    if bass_midi is not None:
+        while bass_midi >= notes[0]:
+            bass_midi -= 12
+        notes = [bass_midi] + notes
+
+    return notes
+
+
+def build_midi(chord_sequence, bpm, repeat, velocity=100):
+    """
+    chord_sequence: list of (notes, beats) pairs.
+    Each chord plays for `beats` quarter-note beats, repeated `repeat` times.
+    """
+    ticks = 480
+    mid = mido.MidiFile(type=0, ticks_per_beat=ticks)
+    track = mido.MidiTrack()
+    mid.tracks.append(track)
+
+    track.append(mido.MetaMessage('set_tempo', tempo=mido.bpm2tempo(bpm), time=0))
+
+    for notes, beats in chord_sequence:
+        duration = int(beats * ticks)
+        for _ in range(repeat):
+            if not notes:
+                track.append(mido.MetaMessage('marker', text='rest', time=duration))
+                continue
+            for note in notes:
+                track.append(mido.Message('note_on', channel=0, note=note, velocity=velocity, time=0))
+            first = True
+            for note in notes:
+                track.append(mido.Message('note_off', channel=0, note=note, velocity=0,
+                                          time=duration if first else 0))
+                first = False
+
+    track.append(mido.MetaMessage('end_of_track', time=2 * ticks))  # decay tail
+    return mid
+
+
+def find_soundfont():
+    for path in SOUNDFONT_PATHS:
+        if os.path.exists(path):
+            return path
+    return None
+
+
+def play(chord_sequence, bpm, repeat, gain=0.8, velocity=100):
+    sf = find_soundfont()
+    if not sf:
+        sys.exit("No soundfont found. Install fluid-soundfont-gm or timgm6mb-soundfont.")
+
+    mid = build_midi(chord_sequence, bpm, repeat, velocity)
+
+    with tempfile.NamedTemporaryFile(suffix='.mid', delete=False) as f:
+        mid.save(file=f)
+        tmp = f.name
+
+    try:
+        result = subprocess.run(
+            ['fluidsynth', '-ni', '-q', '-g', str(gain), sf, tmp],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+        )
+        if result.returncode != 0:
+            sys.exit(f"fluidsynth failed:\n{result.stderr.decode().strip()}")
+    finally:
+        os.unlink(tmp)
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        prog='chord',
+        description='Play a named musical chord',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            'Duration suffix: append :N or :N. to any chord  (1=whole 2=half 4=quarter 8=eighth 16=sixteenth, . for dotted)\n'
+            '\n'
+            'Examples:\n'
+            '  chord Dm G7 Cmaj7\n'
+            '  chord Dm:2 G7:4 G7:4 Cmaj7:1 --allegro\n'
+            '  chord Dm:2. G7:4 Cmaj7:2 --bpm 120\n'
+            '  chord Dm7/9 --duration 4 --repeat 2\n'
+            '  chord --list-chords'
+        ),
+    )
+    parser.add_argument('chords', nargs='*', metavar='CHORD[:DUR]',
+                        help='Chord names with optional duration suffix, e.g. Dm:4 G7:2 Cmaj7')
+    parser.add_argument('--duration', '-d', default='1', metavar='N[.]',
+                        help='Default duration for chords without a suffix (default: 1 = whole note)')
+    parser.add_argument('--repeat', '-r', type=int, default=1, metavar='N',
+                        help='Repeat count per chord (default: 1)')
+    parser.add_argument('--gain', '-g', type=float, default=0.8, metavar='G',
+                        help='FluidSynth master gain, float (default: 0.8)')
+    parser.add_argument('--velocity', '-v', type=int, default=100, metavar='V',
+                        help='MIDI note velocity 1-127 (default: 100)')
+    parser.add_argument('--bpm', type=int, metavar='N', help='Explicit BPM')
+    parser.add_argument('--tempo', metavar='MARKING',
+                        help='Italian tempo marking (allegro, andante, ...)')
+    parser.add_argument('--list-chords', action='store_true',
+                        help='List supported chord qualities and exit')
+
+    for name in TEMPO_BPM:
+        parser.add_argument(f'--{name}', dest=f'tempo_{name}', action='store_true',
+                            default=False, help=argparse.SUPPRESS)
+
+    # Rests like '-:2' start with '-' which confuses argparse.
+    # Swap them to a non-dash prefix, then restore after parsing.
+    _M = '\x01'
+    cooked = [_M + a[1:] if a.startswith('-:') else a for a in sys.argv[1:]]
+    args = parser.parse_args(cooked)
+    args.chords = ['-' + a[1:] if a.startswith(_M) else a for a in args.chords]
+
+    if args.list_chords:
+        print("Supported chord qualities (append to root note):")
+        for q, ivs in CHORD_QUALITIES:
+            if q:
+                print(f"  {q:<10}  [{', '.join(str(i) for i in ivs)}]")
+        sys.exit(0)
+
+    if not args.chords:
+        parser.print_help()
+        sys.exit(1)
+
+    # Resolve default duration
+    try:
+        default_beats = duration_beats(args.duration)
+    except ValueError as e:
+        sys.exit(f"Bad --duration value: {e}")
+
+    # Resolve BPM
+    if args.bpm:
+        bpm = args.bpm
+    elif args.tempo:
+        t = args.tempo.lower()
+        if t not in TEMPO_BPM:
+            sys.exit(f"Unknown tempo {args.tempo!r}. Options: {', '.join(TEMPO_BPM)}")
+        bpm = TEMPO_BPM[t]
+    else:
+        bpm = TEMPO_BPM['allegro']
+        for name in TEMPO_BPM:
+            if getattr(args, f'tempo_{name}', False):
+                bpm = TEMPO_BPM[name]
+                break
+
+    repeat_str = f'  x{args.repeat}' if args.repeat > 1 else ''
+    chord_sequence = []
+
+    for token in args.chords:
+        try:
+            chord_name, beats = split_duration(token)
+        except ValueError as e:
+            sys.exit(f"Bad duration in {token!r}: {e}")
+        if beats is None:
+            beats = default_beats
+        if chord_name == '-':
+            notes = []
+            note_names_only = 'rest'
+        else:
+            try:
+                notes = parse_chord(chord_name)
+            except ValueError as e:
+                sys.exit(f"Cannot parse {token!r}: {e}")
+            note_names_only = ' '.join(NOTE_NAMES[n % 12] for n in notes)
+
+        chord_sequence.append((notes, beats))
+        dur_label = DURATION_LABEL.get(beats, f'{beats}b')
+        print(f"{token:<12}  {note_names_only:<24}  {dur_label:<16}  @ {bpm} BPM{repeat_str}")
+
+    play(chord_sequence, bpm, args.repeat, gain=args.gain, velocity=args.velocity)
+
+
+if __name__ == '__main__':
+    try:
+        main()
+    except KeyboardInterrupt:
+        print()
+        sys.exit(130)

@@ -1,0 +1,15 @@
+# debhelper build staging
+debian/chord/
+debian/.debhelper/
+debian/files
+debian/debhelper-build-stamp
+
+# dpkg-buildpackage output (lands in parent dir)
+../*.deb
+../*.buildinfo
+../*.changes
+
+# python
+__pycache__/
+*.pyc
+debian/*.substvars
