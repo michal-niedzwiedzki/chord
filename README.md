@@ -22,6 +22,7 @@ Or install directly without packaging:
 
 ```bash
 make install   # copies src/chord to /usr/local/bin/chord
+make install-local   # per-user install to ~/.local/bin/chord (no sudo)
 ```
 
 ---
@@ -305,9 +306,16 @@ Rests are represented as MIDI marker meta-messages, which advance the playback c
 
 ## Building
 
+Development requirements (Debian):
+
+```bash
+sudo apt install make dpkg-dev debhelper
+```
+
 ```bash
 make deb      # build .deb package  →  ../chord_0.1.0-1_all.deb
 make test     # run the chord parser test suite
 make install  # install to /usr/local/bin (no packaging)
+make install-local  # install to ~/.local/bin (no sudo)
 make clean    # remove build artifacts
 ```

@@ -1,10 +1,16 @@
-.PHONY: deb install clean test
+.PHONY: deb install install-local clean test
+
+PREFIX ?= /usr/local
+BINDIR ?= $(PREFIX)/bin
 
 deb:
 	dpkg-buildpackage -b -uc -us
 
 install:
-	install -m 755 src/chord /usr/local/bin/chord
+	install -D -m 755 src/chord $(DESTDIR)$(BINDIR)/chord
+
+install-local:
+	$(MAKE) install PREFIX=$(HOME)/.local
 
 test:
 	python3 tests/test_parser.py

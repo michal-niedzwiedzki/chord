@@ -13,3 +13,6 @@ debian/debhelper-build-stamp
 __pycache__/
 *.pyc
 debian/*.substvars
+
+# editors
+.vscode/
